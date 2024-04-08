@@ -5,6 +5,9 @@ import numpy as np
 import os
 import random
 import torch
+import time
+import math
+import sys
 
 from collections import Counter
 from torch.utils.data import DataLoader
@@ -75,7 +78,7 @@ def intersection_over_union(boxes_preds, boxes_labels, box_format="midpoint"):
     return intersection / (box1_area + box2_area - intersection + 1e-6)
 
 
-def non_max_suppression(bboxes, iou_threshold, threshold, box_format="corners"):
+def non_max_suppression(bboxes, threshold, iou_threshold, box_format="midpoint"):
     """
 
     Does Non Max Suppression given bboxes
@@ -91,34 +94,33 @@ def non_max_suppression(bboxes, iou_threshold, threshold, box_format="corners"):
         list: bboxes after performing NMS given a specific IoU threshold
     """
 
-    assert type(bboxes) == list
+    assert isinstance(bboxes, list)
 
-    bboxes = [box for box in bboxes if box[1] > threshold]
-    bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
+    bboxes = np.array([box for box in bboxes if box[1] > threshold])
+    if len(bboxes) == 0:
+        return []
+
+    bboxes = bboxes[bboxes[:, 1].argsort()[::-1]]  # Sort by confidence score
     bboxes_after_nms = []
 
-    while bboxes:
-        chosen_box = bboxes.pop(0)
+    while len(bboxes) > 0:
+        chosen_box = bboxes[0]
+        bboxes = bboxes[1:]
 
-        bboxes = [
-            box
-            for box in bboxes
-            if box[0] != chosen_box[0]
-            or intersection_over_union(
-                torch.tensor(chosen_box[2:]),
-                torch.tensor(box[2:]),
-                box_format=box_format,
-            )
-            < iou_threshold
-        ]
+        iou_scores = intersection_over_union(torch.tensor(chosen_box[2:]), torch.tensor(bboxes)[:, 2:], box_format)
+        suppress_indices = np.where(iou_scores > iou_threshold)[0]
 
-        bboxes_after_nms.append(chosen_box)
+        bboxes = np.delete(bboxes, suppress_indices, axis=0)
+        bboxes_after_nms.append(chosen_box.tolist())
+
+    # print(intersection_over_union(torch.tensor(bboxes_after_nms[0][2:]), torch.tensor(bboxes_after_nms[1:][2:]), box_format))
+    # print(bboxes_after_nms[:4])
 
     return bboxes_after_nms
 
 
 def mean_average_precision(
-    pred_boxes, true_boxes, iou_threshold=0.5, box_format="midpoint", num_classes=20
+    pred_boxes, true_boxes, iou_threshold=0.5, box_format="midpoint", num_classes=1 
 ):
     """
 
@@ -136,106 +138,106 @@ def mean_average_precision(
         float: mAP value across all classes given a specific IoU threshold
     """
 
-    # list storing all AP for respective classes
-    average_precisions = []
 
     # used for numerical stability later on
     epsilon = 1e-6
 
-    for c in range(num_classes):
-        detections = []
-        ground_truths = []
+    detections = []
+    ground_truths = []
 
-        # Go through all predictions and targets,
-        # and only add the ones that belong to the
-        # current class c
-        for detection in pred_boxes:
-            if detection[1] == c:
-                detections.append(detection)
+    # Go through all predictions and targets,
+    # and only add the ones that belong to the
+    # current class c
+    for detection in pred_boxes:
+        if detection[1] == 0:
+            detections.append(detection)
 
-        for true_box in true_boxes:
-            if true_box[1] == c:
-                ground_truths.append(true_box)
+    for true_box in true_boxes:
+        if true_box[1] == 0:
+            ground_truths.append(true_box)
 
-        # find the amount of bboxes for each training example
-        # Counter here finds how many ground truth bboxes we get
-        # for each training example, so let's say img 0 has 3,
-        # img 1 has 5 then we will obtain a dictionary with:
-        # amount_bboxes = {0:3, 1:5}
-        amount_bboxes = Counter([gt[0] for gt in ground_truths])
+    # find the amount of bboxes for each training example
+    # Counter here finds how many ground truth bboxes we get
+    # for each training example, so let's say img 0 has 3,
+    # img 1 has 5 then we will obtain a dictionary with:
+    # amount_bboxes = {0:3, 1:5}
+    amount_bboxes = Counter([gt[0] for gt in ground_truths])
 
-        # We then go through each key, val in this dictionary
-        # and convert to the following (w.r.t same example):
-        # ammount_bboxes = {0:torch.tensor[0,0,0], 1:torch.tensor[0,0,0,0,0]}
-        for key, val in amount_bboxes.items():
-            amount_bboxes[key] = torch.zeros(val)
+    # We then go through each key, val in this dictionary
+    # and convert to the following (w.r.t same example):
+    # ammount_bboxes = {0:torch.tensor[0,0,0], 1:torch.tensor[0,0,0,0,0]}
+    for key, val in amount_bboxes.items():
+        amount_bboxes[key] = torch.zeros(val)
 
-        # sort by box probabilities which is index 2
-        detections.sort(key=lambda x: x[2], reverse=True)
-        TP = torch.zeros((len(detections)))
-        FP = torch.zeros((len(detections)))
-        total_true_bboxes = len(ground_truths)
+    # sort by box probabilities which is index 2
+    detections.sort(key=lambda x: x[2], reverse=True)
+    TP = torch.zeros((len(detections)))
+    FP = torch.zeros((len(detections)))
+    total_true_bboxes = len(ground_truths)
 
-        # If none exists for this class then we can safely skip
-        if total_true_bboxes == 0:
-            continue
+    for detection_idx, detection in enumerate(detections):
+        # Only take out the ground_truths that have the same
+        # training idx as detection
+        ground_truth_img = [
+            bbox for bbox in ground_truths if bbox[0] == detection[0]
+        ]
 
-        for detection_idx, detection in enumerate(detections):
-            # Only take out the ground_truths that have the same
-            # training idx as detection
-            ground_truth_img = [
-                bbox for bbox in ground_truths if bbox[0] == detection[0]
-            ]
+        num_gts = len(ground_truth_img)
+        best_iou = 0
 
-            num_gts = len(ground_truth_img)
-            best_iou = 0
+        for idx, gt in enumerate(ground_truth_img):
+            iou = intersection_over_union(
+                torch.tensor(detection[3:]),
+                torch.tensor(gt[3:]),
+                box_format=box_format,
+            )
 
-            for idx, gt in enumerate(ground_truth_img):
-                iou = intersection_over_union(
-                    torch.tensor(detection[3:]),
-                    torch.tensor(gt[3:]),
-                    box_format=box_format,
-                )
+            if iou > best_iou:
+                best_iou = iou
+                best_gt_idx = idx
 
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = idx
-
-            if best_iou > iou_threshold:
-                # only detect ground truth detection once
-                if amount_bboxes[detection[0]][best_gt_idx] == 0:
-                    # true positive and add this bounding box to seen
-                    TP[detection_idx] = 1
-                    amount_bboxes[detection[0]][best_gt_idx] = 1
-                else:
-                    FP[detection_idx] = 1
-
-            # if IOU is lower then the detection is a false positive
+        if best_iou > iou_threshold:
+            # only detect ground truth detection once
+            if amount_bboxes[detection[0]][best_gt_idx] == 0:
+                # true positive and add this bounding box to seen
+                TP[detection_idx] = 1
+                amount_bboxes[detection[0]][best_gt_idx] = 1
             else:
                 FP[detection_idx] = 1
 
-        TP_cumsum = torch.cumsum(TP, dim=0)
-        FP_cumsum = torch.cumsum(FP, dim=0)
-        recalls = TP_cumsum / (total_true_bboxes + epsilon)
-        precisions = TP_cumsum / (TP_cumsum + FP_cumsum + epsilon)
-        precisions = torch.cat((torch.tensor([1]), precisions))
-        recalls = torch.cat((torch.tensor([0]), recalls))
-        # torch.trapz for numerical integration
-        average_precisions.append(torch.trapz(precisions, recalls))
+        # if IOU is lower then the detection is a false positive
+        else:
+            FP[detection_idx] = 1
 
-    return sum(average_precisions) / len(average_precisions)
+    TP_cumsum = torch.cumsum(TP, dim=0)
+    FP_cumsum = torch.cumsum(FP, dim=0)
+    recalls = TP_cumsum / (total_true_bboxes + epsilon)
+    precisions = TP_cumsum / (TP_cumsum + FP_cumsum + epsilon)
+    precisions = torch.cat((torch.tensor([1]), precisions))
+    recalls = torch.cat((torch.tensor([0]), recalls))
+    
+    # Append precision and recall values to lists
+    # precisions.append(precisions.numpy())
+    # recalls.append(recalls.numpy())
+
+    # torch.trapz for numerical integration
+    AP = torch.trapz(precisions, recalls)
+
+    return AP, precisions, recalls
 
 
-def plot_image(image, boxes):
+def plot_single_example(image, boxes, save_path):
     """Plots predicted bounding boxes on the image"""
-    cmap = plt.get_cmap("tab20b")
-    class_labels = config.COCO_LABELS if config.DATASET=='COCO' else config.PASCAL_CLASSES
-    colors = [cmap(i) for i in np.linspace(0, 1, len(class_labels))]
     im = np.array(image)
     height, width, _ = im.shape
 
     # Create figure and axes
     fig, ax = plt.subplots(1)
+
+    # Disable axis and grid
+    ax.axis('off')
+    ax.grid(False)
+
     # Display the image
     ax.imshow(im)
 
@@ -254,21 +256,29 @@ def plot_image(image, boxes):
             box[2] * width,
             box[3] * height,
             linewidth=2,
-            edgecolor=colors[int(class_pred)],
+            edgecolor='g',
             facecolor="none",
         )
+
+        # class_labels = ['person']
+
         # Add the patch to the Axes
         ax.add_patch(rect)
         plt.text(
             upper_left_x * width,
             upper_left_y * height,
-            s=class_labels[int(class_pred)],
+            s='person',
             color="white",
             verticalalignment="top",
-            bbox={"color": colors[int(class_pred)], "pad": 0},
+            bbox={"color": 'g', "pad": 0},
         )
 
-    plt.show()
+
+    # Save the figure
+    plt.savefig(save_path)
+
+    # Close the figure to release memory
+    plt.close()
 
 
 def get_evaluation_bboxes(
@@ -295,7 +305,8 @@ def get_evaluation_bboxes(
         bboxes = [[] for _ in range(batch_size)]
         for i in range(3):
             S = predictions[i].shape[2]
-            anchor = torch.tensor([*anchors[i]]).to(device) * S
+            # anchor = torch.tensor([*anchors[i]]).to(device) * S
+            anchor = anchors[i]
             boxes_scale_i = cells_to_bboxes(
                 predictions[i], anchor, S=S, is_preds=True
             )
@@ -310,8 +321,8 @@ def get_evaluation_bboxes(
         for idx in range(batch_size):
             nms_boxes = non_max_suppression(
                 bboxes[idx],
-                iou_threshold=iou_threshold,
                 threshold=threshold,
+                iou_threshold=iou_threshold,               
                 box_format=box_format,
             )
 
@@ -324,7 +335,9 @@ def get_evaluation_bboxes(
 
             train_idx += 1
 
-    model.train()
+    # model.train()
+    # print(all_pred_boxes[:4])
+    # print(all_true_boxes[:4])
     return all_pred_boxes, all_true_boxes
 
 
@@ -367,6 +380,7 @@ def cells_to_bboxes(predictions, anchors, S, is_preds=True):
     converted_bboxes = torch.cat((best_class, scores, x, y, w_h), dim=-1).reshape(BATCH_SIZE, num_anchors * S * S, 6)
     return converted_bboxes.tolist()
 
+
 def check_class_accuracy(model, loader, threshold):
     model.eval()
     tot_class_preds, correct_class = 0, 0
@@ -394,11 +408,78 @@ def check_class_accuracy(model, loader, threshold):
             correct_noobj += torch.sum(obj_preds[noobj] == y[i][..., 0][noobj])
             tot_noobj += torch.sum(noobj)
 
-    print(f"Class accuracy is: {(correct_class/(tot_class_preds+1e-16))*100:2f}%")
-    print(f"No obj accuracy is: {(correct_noobj/(tot_noobj+1e-16))*100:2f}%")
-    print(f"Obj accuracy is: {(correct_obj/(tot_obj+1e-16))*100:2f}%")
-    model.train()
+    
+    # print(f'correct class: {correct_class}, correct obj: {correct_obj}, noobj: {correct_noobj}')
+    # print(f'total obj: {tot_obj}, total noobj: {tot_noobj}, noobj: {correct_noobj}')
 
+    # Print accuracy metrics
+    class_accuracy = (correct_class / (tot_obj+ 1e-16)) * 100
+    noobj_accuracy = (correct_noobj / (tot_noobj + 1e-16)) * 100
+    obj_accuracy = (correct_obj / (tot_obj + 1e-16)) * 100
+    # print(f"Class accuracy is: {class_accuracy:.2f}%")
+    # print(f"No obj accuracy is: {noobj_accuracy:.2f}%")
+    # print(f"Obj accuracy is: {obj_accuracy:.2f}%")
+    score = (20 * math.acos(noobj_accuracy / 100) + 
+            20 * math.acos(obj_accuracy / 100) + 
+            class_accuracy / 10)
+
+    model.train()
+    return score, class_accuracy, noobj_accuracy, obj_accuracy
+
+
+'''
+def check_class_accuracy(model, loader, threshold):
+    model.eval()
+    correct_class = 0
+    correct_noobj = 0
+    correct_obj = 0
+    tot_noobj = 0
+    tot_obj = 0
+
+    for idx, (x, y) in enumerate(loader):
+        x = x.to(config.DEVICE)
+        with torch.no_grad():
+            out = model(x)
+
+        for i in range(3):
+            y[i] = y[i].to(config.DEVICE)
+            # print(y[i].shape)
+            obj = y[i][..., 0] == 1
+            noobj = y[i][..., 0] == 0
+            # print(obj.shape)
+
+            # Compute objectness score and apply threshold
+            obj_preds = torch.sigmoid(out[i][..., 0])  # Normalize objectness score
+            obj_preds = obj_preds > threshold
+
+            # Compute accuracy for "no object" class
+            correct_noobj += torch.sum(obj_preds[noobj] == 0)  # Predicted as "no object"
+            tot_noobj += torch.sum(noobj)
+
+            # Compute accuracy for "object" class
+            correct_obj += torch.sum(obj_preds[obj] == 1)  # Predicted as "object"
+            tot_obj += torch.sum(obj)
+
+            # Compute class accuracy (as there's only one class)
+            correct_class += torch.sum(obj_preds[obj] == 1)  # Predicted as "object"
+
+    print(f'correct class: {correct_class}, correct obj: {correct_obj}, noobj: {correct_noobj}')
+    print(f'total obj: {tot_obj}, total noobj: {tot_noobj}, noobj: {correct_noobj}')
+
+    # Print accuracy metrics
+    class_accuracy = (correct_class / (tot_obj+ 1e-16)) * 100
+    noobj_accuracy = (correct_noobj / (tot_noobj + 1e-16)) * 100
+    obj_accuracy = (correct_obj / (tot_obj + 1e-16)) * 100
+    # print(f"Class accuracy is: {class_accuracy:.2f}%")
+    # print(f"No obj accuracy is: {noobj_accuracy:.2f}%")
+    # print(f"Obj accuracy is: {obj_accuracy:.2f}%")
+    score = (20 * math.acos(noobj_accuracy / 100) + 
+            20 * math.acos(obj_accuracy / 100) + 
+            class_accuracy / 10)
+
+    # model.train()
+    return score, class_accuracy, noobj_accuracy, obj_accuracy
+'''
 
 def get_mean_std(loader):
     # var[X] = E[X**2] - E[X]**2
@@ -428,39 +509,25 @@ def load_checkpoint(checkpoint_file, model, optimizer, lr):
     print("=> Loading checkpoint")
     checkpoint = torch.load(checkpoint_file, map_location=config.DEVICE)
     model.load_state_dict(checkpoint["state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    # optimizer.load_state_dict(checkpoint["optimizer"])
 
-    # If we don't do this then it will just have learning rate of old checkpoint
-    # and it will lead to many hours of debugging \:
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+    # # If we don't do this then it will just have learning rate of old checkpoint
+    # # and it will lead to many hours of debugging \:
+    # for param_group in optimizer.param_groups:
+    #     param_group["lr"] = lr
 
 
-def get_loaders(train_csv_path, test_csv_path):
+def get_test_loader(test_csv_path):
     from dataset import YOLODataset
 
     IMAGE_SIZE = config.IMAGE_SIZE
-    train_dataset = YOLODataset(
-        train_csv_path,
-        transform=config.train_transforms,
-        S=[IMAGE_SIZE // 32, IMAGE_SIZE // 16, IMAGE_SIZE // 8],
-        data_dir=config.TRAIN_DIR,
-        anchors=config.ANCHORS,
-    )
+
     test_dataset = YOLODataset(
         test_csv_path,
         transform=config.test_transforms,
         S=[IMAGE_SIZE // 32, IMAGE_SIZE // 16, IMAGE_SIZE // 8],
         data_dir=config.TEST_DIR,
         anchors=config.ANCHORS,
-    )
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=config.BATCH_SIZE,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY,
-        shuffle=True,
-        drop_last=False,
     )
     test_loader = DataLoader(
         dataset=test_dataset,
@@ -471,9 +538,46 @@ def get_loaders(train_csv_path, test_csv_path):
         drop_last=False,
     )
 
+    return test_loader
+
+def get_loaders(train_csv_path, val_csv_path):
+    from dataset import YOLODataset
+
+    IMAGE_SIZE = config.IMAGE_SIZE
+    train_dataset = YOLODataset(
+        train_csv_path,
+        transform=config.train_transforms,
+        S=[IMAGE_SIZE // 32, IMAGE_SIZE // 16, IMAGE_SIZE // 8],
+        data_dir=config.TRAIN_DIR,
+        anchors=config.ANCHORS,
+    )
+    val_dataset = YOLODataset(
+        val_csv_path,
+        transform=config.test_transforms,
+        S=[IMAGE_SIZE // 32, IMAGE_SIZE // 16, IMAGE_SIZE // 8],
+        data_dir=config.VAL_DIR,
+        anchors=config.ANCHORS,
+    )
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=config.BATCH_SIZE,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=config.PIN_MEMORY,
+        shuffle=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        dataset=val_dataset,
+        batch_size=config.BATCH_SIZE,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=config.PIN_MEMORY,
+        shuffle=False,
+        drop_last=False,
+    )
+
     train_eval_dataset = YOLODataset(
         train_csv_path,
-        transform=config.test_transforms,
+        transform=config.train2_transforms,
         S=[IMAGE_SIZE // 32, IMAGE_SIZE // 16, IMAGE_SIZE // 8],
         data_dir=config.TRAIN_DIR,
         anchors=config.ANCHORS,
@@ -487,9 +591,9 @@ def get_loaders(train_csv_path, test_csv_path):
         drop_last=False,
     )
 
-    return train_loader, test_loader, train_eval_loader
+    return train_loader, val_loader, train_eval_loader
 
-def plot_couple_examples(model, loader, thresh, iou_thresh, anchors):
+def plot_examples(model, loader, thresh, iou_thresh, anchors, path):
     model.eval()
     x, y = next(iter(loader))
     x = x.to("cuda")
@@ -508,10 +612,17 @@ def plot_couple_examples(model, loader, thresh, iou_thresh, anchors):
         model.train()
 
     for i in range(batch_size):
+        # start_time = time.time()
         nms_boxes = non_max_suppression(
-            bboxes[i], iou_threshold=iou_thresh, threshold=thresh, box_format="midpoint",
+            bboxes[i], threshold=thresh, iou_threshold=iou_thresh, box_format="midpoint",#bboxes, iou_threshold, threshold, box_format="midpoint"
         )
-        plot_image(x[i].permute(1,2,0).detach().cpu(), nms_boxes)
+        # end_time = time.time()
+        # nms_execution_time = end_time - start_time
+        # print("NMS Execution time:", nms_execution_time)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        plot_single_example(x[i].permute(1,2,0).detach().cpu(), nms_boxes, os.path.join(path, f'image_{i}.png'))
 
 
 
