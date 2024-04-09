@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import config
 import torch
@@ -46,7 +47,7 @@ def main():#prediction
 
     if config.LOAD_MODEL:
         load_checkpoint(
-            config.CHECKPOINT_FILE_PRED, model, optimizer, config.LEARNING_RATE
+            config.CHECKPOINT_FILE, model, optimizer, config.LEARNING_RATE
         )
     
     score, class_accuracy, noobj_accuracy, obj_accuracy = check_class_accuracy(model, test_loader, threshold=config.CONF_THRESHOLD)
@@ -68,11 +69,10 @@ def main():#prediction
 
     if not os.path.exists('output/pred6'):
         # Create directory recursively
-        os.makedirs(path)
+        os.makedirs('output/pred6')
 
     # plot_examples(model, test_loader, 0.25, 0.6, scaled_anchors)#model, loader, thresh, iou_thresh_nms, anchors
     plot_examples(model, test_loader, config.CONF_THRESHOLD, config.NMS_IOU_THRESH, scaled_anchors, f'./output/pred6/images_{1}')#model, loader, thresh, iou_thresh_nms, anchors
-
     print(f'map: {map_val}, obj_accuracy: {obj_accuracy}, noobj_accuracy: {noobj_accuracy}')
 
 
