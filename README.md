@@ -2,6 +2,8 @@
 
 **Infravision** is a cutting-edge project designed to enhance surveillance capabilities by leveraging **thermal infrared (TIR) imaging** for human detection. Unlike traditional RGB images, TIR images excel in low-light and nighttime conditions, making it a powerful tool for robust and reliable detection of human heat signatures. This system integrates real-time alerts, GPS coordinates, and mobile application functionality to provide enhanced security and rapid decision-making.
 
+![Output Image](out.png)
+
 ## Table of Contents
 
 - [Project Overview](#project-overview)
